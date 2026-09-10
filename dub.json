@@ -1,0 +1,55 @@
+{
+	"name": "frostlake",
+	"description": "A dependency-free D driver for Frostlake's HTTP protocol",
+	"authors": ["Frostlake contributors"],
+	"license": "Apache-2.0",
+	"copyright": "Copyright © 2026, Frostlake contributors",
+	"targetType": "library",
+	"sourcePaths": ["source"],
+	"importPaths": ["source"],
+	"dependencies": {},
+	"configurations": [
+		{
+			"name": "library",
+			"targetType": "library"
+		},
+		{
+			"name": "unittest",
+			"targetType": "executable",
+			"targetName": "frostlake-unittests",
+			"sourcePaths": ["source", "tests"],
+			"importPaths": ["source", "."],
+			"mainSourceFile": "tests/unittest_main.d",
+			"excludedSourceFiles": [
+				"tests/integration_main.d",
+				"tests/testkit_main.d"
+			]
+		},
+		{
+			"name": "integration",
+			"targetType": "executable",
+			"targetName": "frostlake-integration",
+			"sourcePaths": ["source", "tests"],
+			"importPaths": ["source", "."],
+			"mainSourceFile": "tests/integration_main.d",
+			"excludedSourceFiles": ["tests/testkit_main.d", "tests/unittest_main.d"]
+		},
+		{
+			"name": "testkit",
+			"targetType": "executable",
+			"targetName": "frostlake-testkit",
+			"sourcePaths": ["source", "tests"],
+			"importPaths": ["source", "."],
+			"mainSourceFile": "tests/testkit_main.d",
+			"excludedSourceFiles": ["tests/integration_main.d", "tests/unittest_main.d"]
+		},
+		{
+			"name": "example",
+			"targetType": "executable",
+			"targetName": "frostlake-example",
+			"sourcePaths": ["source", "examples"],
+			"importPaths": ["source"],
+			"mainSourceFile": "examples/basic.d"
+		}
+	]
+}

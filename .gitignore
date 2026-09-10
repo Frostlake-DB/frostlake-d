@@ -1,0 +1,25 @@
+# dub build output
+.dub/
+.dubhome/
+*.lib
+*.a
+*.exe
+*.obj
+*.o
+*.pdb
+*.ilk
+frostlake-unittests*
+frostlake-integration*
+frostlake-testkit*
+frostlake-example*
+frostlake.lib
+
+# the no-dub build loop
+.build/
+
+# testkit output
+results/
+
+# engine logs from a test run
+*.log
+.idea
