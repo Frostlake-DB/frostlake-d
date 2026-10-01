@@ -388,6 +388,21 @@ package(frostlake) bool parseDecimal(string text, out BigInt digits, out long ex
     return sawDigit;
 }
 
+/// Every double, subnormals included, is an integer once scaled by 2^binaryScale.
+private enum int binaryScale = 1200;
+
+/// A finite, non-negative double as that exact integer.
+private BigInt scaledExact(double x) @safe pure
+{
+    import std.math : frexp;
+
+    if (x == 0) return BigInt(0);
+    int exp;
+    const fraction = frexp(x, exp); // x = fraction · 2^exp, fraction in [0.5, 1)
+    auto mantissa = BigInt(cast(long)(fraction * 9007199254740992.0)); // · 2^53
+    return mantissa << cast(uint)(exp - 53 + binaryScale);
+}
+
 /**
  * Whether a correctly rounding parser reads `text` back as exactly `value`.
  *
@@ -399,7 +414,7 @@ package(frostlake) bool parseDecimal(string text, out BigInt digits, out long ex
  */
 package(frostlake) bool roundTripsTo(string text, double value) @safe pure
 {
-    import std.math : frexp, nextDown, nextUp, isFinite;
+    import std.math : nextDown, nextUp, isFinite;
 
     BigInt digits;
     long k;
@@ -409,30 +424,136 @@ package(frostlake) bool roundTripsTo(string text, double value) @safe pure
     if (negative != (value < 0)) return false;
     const magnitude = value < 0 ? -value : value;
 
-    // Every double, subnormals included, is an integer once scaled by 2^scale.
-    enum int scale = 1200;
-    static BigInt exact(double x) @safe pure
-    {
-        if (x == 0) return BigInt(0);
-        int exp;
-        const fraction = frexp(x, exp); // x = fraction · 2^exp, fraction in [0.5, 1)
-        auto mantissa = BigInt(cast(long)(fraction * 9007199254740992.0)); // · 2^53
-        return mantissa << cast(uint)(exp - 53 + scale);
-    }
-
-    auto below = exact(nextDown(magnitude));
-    auto here = exact(magnitude);
+    auto below = scaledExact(nextDown(magnitude));
+    auto here = scaledExact(magnitude);
     // Past the largest double the upper neighbour is infinity; mirror the gap.
     const up = nextUp(magnitude);
-    auto above = isFinite(up) ? exact(up) : here + (here - below);
+    auto above = isFinite(up) ? scaledExact(up) : here + (here - below);
 
     // Candidate = digits · 10^k · 2^scale, kept over a common denominator 10^p.
     const long p = k < 0 ? -k : 0;
     const long q = k > 0 ? k : 0;
-    auto candidate = (digits * (BigInt(10) ^^ cast(ulong) q)) << scale;
+    auto candidate = (digits * (BigInt(10) ^^ cast(ulong) q)) << binaryScale;
     auto tenP = BigInt(10) ^^ cast(ulong) p;
     auto twice = candidate * 2;
     return (below + here) * tenP < twice && twice < (here + above) * tenP;
+}
+
+/**
+ * The double nearest the decimal numeral `text`, a tie going to the even
+ * neighbour — the reading a correctly rounding parser gives.
+ *
+ * `approx` is a first reading from a parser that may land an ulp or two away.
+ * A short numeral is settled by one exact operation: at most 2^53 and scaled
+ * by a power of ten no larger than 10^22, it is two exact doubles, and IEEE
+ * rounds their product or quotient correctly. A longer one is compared with
+ * the midpoints to `approx`'s neighbours in integer arithmetic, stepping
+ * towards it until it falls between them. Anything that is not a plain
+ * numeral, and an `approx` that is zero or not finite, is answered as it came.
+ */
+package(frostlake) double nearestDouble(string text, double approx) @safe pure
+{
+    import std.math : isFinite, nextDown, nextUp;
+
+    BigInt digits;
+    long k;
+    bool negative;
+    if (!parseDecimal(text, digits, k, negative) || digits == 0
+        || !isFinite(approx) || approx == 0)
+        return approx;
+
+    static immutable double[23] powersOfTen = [
+        1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11,
+        1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22,
+    ];
+    if (digits <= BigInt(9_007_199_254_740_992L) && k >= -22 && k <= 22)
+    {
+        const whole = cast(double) digits.toLong();
+        const exact = k >= 0 ? whole * powersOfTen[k] : whole / powersOfTen[-k];
+        return negative ? -exact : exact;
+    }
+
+    // numeral · 2^scale, doubled, over a common denominator 10^p — the same
+    // footing as the midpoints below.
+    const long p = k < 0 ? -k : 0;
+    const long q = k > 0 ? k : 0;
+    // A numeral this long is not one a double was printed as; the reading stands.
+    if (p > 1200 || q > 400) return approx;
+    auto tenP = BigInt(10) ^^ cast(ulong) p;
+    auto twice = ((digits * (BigInt(10) ^^ cast(ulong) q)) << binaryScale) * 2;
+
+    double magnitude = approx < 0 ? -approx : approx;
+    foreach (step; 0 .. 64)
+    {
+        if (magnitude == 0) break;
+        const down = nextDown(magnitude);
+        const up = nextUp(magnitude);
+        auto here = scaledExact(magnitude);
+        auto below = scaledExact(down);
+        // Past the largest double the upper neighbour is infinity; mirror the gap.
+        auto above = isFinite(up) ? scaledExact(up) : here + (here - below);
+        auto lower = (below + here) * tenP;
+        auto upper = (here + above) * tenP;
+        if (twice < lower)
+            magnitude = down;
+        else if (twice > upper && isFinite(up))
+            magnitude = up;
+        else
+        {
+            // On a midpoint the neighbour with the even significand wins.
+            if (twice == lower && isOdd(magnitude)) magnitude = down;
+            else if (twice == upper && isFinite(up) && isOdd(magnitude)) magnitude = up;
+            break;
+        }
+    }
+    return negative ? -magnitude : magnitude;
+}
+
+/// Whether a double's last significand bit is set.
+private bool isOdd(double x) @trusted pure nothrow @nogc
+{
+    return (*cast(const(ulong)*) &x & 1) != 0;
+}
+
+@safe unittest
+{
+    import std.math : nextDown, nextUp;
+
+    union Bits { ulong bits; double value; }
+    static ulong bitsOf(double value) @safe pure nothrow @nogc
+    {
+        Bits b;
+        b.value = value;
+        return b.bits;
+    }
+
+    // Phobos reads this one an ulp high; the nearest double ends in ...e4d9,
+    // and every nearby first reading settles on it.
+    Bits nearest = { bits: 0x407e64d7c929e4d9 };
+    foreach (start; [nextDown(nearest.value), nearest.value, nextUp(nearest.value),
+                     nextUp(nextUp(nearest.value)), "486.3026820789797".to!double])
+        assert(bitsOf(nearestDouble("486.3026820789797", start)) == 0x407e64d7c929e4d9);
+    assert(nearestDouble("-486.3026820789797", -nextUp(nearest.value)) == -nearest.value);
+
+    // Past 2^53 the exact path decides, and a numeral exactly between two
+    // doubles goes to the even one.
+    assert(nearestDouble("9007199254740993", 9007199254740994.0) == 9007199254740992.0);
+    assert(nearestDouble("9007199254740993", 9007199254740992.0) == 9007199254740992.0);
+    assert(nearestDouble("9007199254740995", 9007199254740994.0) == 9007199254740996.0);
+    assert(nearestDouble("9007199254740997", 9007199254740996.0) == 9007199254740996.0);
+
+    // The ends of the range: the smallest subnormal, the largest subnormal,
+    // and the largest double.
+    const smallest = double.min_normal * double.epsilon;     // 2^-1074
+    assert(bitsOf(nearestDouble("4.9406564584124654e-324", 2 * smallest)) == 1);
+    assert(bitsOf(nearestDouble("2.2250738585072011e-308", 2.2250738585072014e-308))
+           == 0xfffffffffffff);
+    assert(nearestDouble("1.7976931348623157e308", nextDown(double.max)) == double.max);
+
+    // What is not a plain numeral, and a zero or non-finite reading, pass through.
+    assert(nearestDouble("NaN", 1.5) == 1.5);
+    assert(nearestDouble("0.000", 0.0) == 0.0);
+    assert(nearestDouble("1e999", double.infinity) == double.infinity);
 }
 
 @safe unittest

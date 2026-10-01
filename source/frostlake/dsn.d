@@ -75,7 +75,7 @@ struct DsnConfig
     /// The server's base URL, without a trailing slash.
     string baseUrl() const @safe pure
     {
-        return format!"%s://%s:%s"(secure ? "https" : "http", host, port);
+        return format!"%s://%s:%s"(secure ? "https" : "http", urlHost(host), port);
     }
 
     /**
@@ -94,6 +94,15 @@ struct DsnConfig
         if (schema.length)    result.put("USE SCHEMA " ~ useIdentifier(schema));
         return result.data;
     }
+}
+
+/**
+ * A host as a URL or a `Host` header writes it: an IPv6 literal goes in
+ * brackets, or its colons would run into the port's.
+ */
+package(frostlake) string urlHost(const(char)[] host) @safe pure
+{
+    return host.canFind(':') ? "[" ~ host.idup ~ "]" : host.idup;
 }
 
 /**
@@ -497,9 +506,14 @@ private ubyte hexValue(char c) @safe pure nothrow @nogc
     // IPv6 literals, with and without a port.
     auto a = parseDsn("frostlake://[::1]:18082/DB");
     assert(a.host == "::1" && a.port == 18082 && a.database == "DB");
+    assert(a.baseUrl == "http://[::1]:18082");
     auto b = parseDsn("frostlake://[2001:db8::1]");
     assert(b.host == "2001:db8::1" && b.port == 18082);
-    assert(b.baseUrl == "http://2001:db8::1:18082");
+    // Bracketed again in the URL, where its colons would run into the port's.
+    assert(b.baseUrl == "http://[2001:db8::1]:18082");
+    assert(urlHost("::1") == "[::1]");
+    assert(urlHost("localhost") == "localhost");
+    assert(urlHost("127.0.0.1") == "127.0.0.1");
 }
 
 @safe unittest

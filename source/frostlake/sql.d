@@ -185,8 +185,24 @@ string[] leadingWords(const(char)[] statement, size_t n) @safe pure
 /// object being named.
 private immutable string[] objectModifiers = [
     "OR", "REPLACE", "TRANSIENT", "TEMPORARY", "TEMP", "VOLATILE",
-    "LOCAL", "GLOBAL", "SECURE", "IF", "NOT", "EXISTS"
+    "LOCAL", "GLOBAL", "SECURE", "IF", "NOT", "EXISTS",
+    "PUBLIC", "PRIVATE", "ICEBERG", "DYNAMIC", "HYBRID", "EVENT",
+    "RECURSIVE", "MATERIALIZED", "EXTERNAL"
 ];
+
+/// The modifiers that make what a `CREATE` names live only as long as the
+/// session that made it.
+private immutable string[] temporaryModifiers = ["TEMPORARY", "TEMP", "VOLATILE"];
+
+/// What a statement does to the session's transaction.
+enum TransactionEffect
+{
+    none,
+    /// `BEGIN`, `BEGIN TRANSACTION`, `BEGIN WORK`, `BEGIN NAME …`, `START TRANSACTION`.
+    begins,
+    /// `COMMIT` or `ROLLBACK`.
+    ends,
+}
 
 /**
  * Whether a request can move the session off the scope the DSN established.
@@ -203,9 +219,60 @@ bool changesScope(const(char)[] sql) @safe pure
     return false;
 }
 
+/**
+ * Whether a statement leaves behind state a fresh session would not have: a
+ * moved scope (see $(D changesScope)), or a temporary object, which lives only
+ * as long as the session that made it.
+ */
+bool touchesSession(const(char)[] statement) @safe pure
+{
+    return statementChangesScope(statement) || createsTemporary(statement);
+}
+
+/**
+ * Whether a statement opens or ends a transaction. `BEGIN` on its own, or
+ * followed by `TRANSACTION`, `WORK` or `NAME`, opens one; `BEGIN` followed by
+ * a statement opens a scripting block instead.
+ */
+TransactionEffect transactionEffect(const(char)[] statement) @safe pure
+{
+    const words = leadingWords(statement, 2);
+    if (words.length == 0) return TransactionEffect.none;
+    switch (words[0])
+    {
+        case "BEGIN":
+            if (words.length == 1) return TransactionEffect.begins;
+            switch (words[1])
+            {
+                case "TRANSACTION", "WORK", "NAME": return TransactionEffect.begins;
+                default: return TransactionEffect.none;
+            }
+        case "START":
+            return words.length == 2 && words[1] == "TRANSACTION"
+                ? TransactionEffect.begins : TransactionEffect.none;
+        case "COMMIT", "ROLLBACK":
+            return TransactionEffect.ends;
+        default:
+            return TransactionEffect.none;
+    }
+}
+
+private bool createsTemporary(const(char)[] statement) @safe pure
+{
+    import std.algorithm : canFind;
+    const words = leadingWords(statement, 16);
+    if (words.length == 0 || words[0] != "CREATE") return false;
+    foreach (word; words[1 .. $])
+    {
+        if (!objectModifiers.canFind(word)) return false;
+        if (temporaryModifiers.canFind(word)) return true;
+    }
+    return false;
+}
+
 private bool statementChangesScope(const(char)[] statement) @safe pure
 {
-    const words = leadingWords(statement, 6);
+    const words = leadingWords(statement, 16);
     if (words.length == 0) return false;
     switch (words[0])
     {
@@ -320,4 +387,49 @@ private bool namesObject(const(string)[] words, const(string)[] want) @safe pure
     assert(!changesScope("SELECT 'USE DATABASE other'"));
     assert(!changesScope("SELECT 1 -- USE DATABASE other"));
     assert(!changesScope("CREATE FUNCTION f() AS $$ USE DATABASE other $$"));
+}
+
+@safe unittest
+{
+    // What a fresh session would not have: a moved scope, a setting, a variable,
+    // or a temporary object.
+    assert(touchesSession("USE SCHEMA other"));
+    assert(touchesSession("SET v = 1"));
+    assert(touchesSession("ALTER SESSION SET TIMEZONE = 'UTC'"));
+    assert(touchesSession("DROP DATABASE IF EXISTS d"));
+    assert(touchesSession("CREATE TEMPORARY TABLE t (a INT)"));
+    assert(touchesSession("create temp table t (a int)"));
+    assert(touchesSession("CREATE OR REPLACE LOCAL TEMPORARY TABLE t (a INT)"));
+    assert(touchesSession("CREATE VOLATILE TABLE t (a INT)"));
+    assert(touchesSession("CREATE OR REPLACE SECURE TEMPORARY VIEW v AS SELECT 1"));
+    assert(touchesSession("CREATE HYBRID TEMPORARY TABLE t (a INT)"));
+
+    // A permanent object, or a word that merely looks like a modifier later on,
+    // leaves the session as it was.
+    assert(!touchesSession("CREATE TABLE t (a INT)"));
+    assert(!touchesSession("CREATE TRANSIENT TABLE t (a INT)"));
+    assert(!touchesSession("CREATE TABLE temporary (a INT)"));
+    assert(!touchesSession("DROP TABLE TEMP"));
+    assert(!touchesSession("INSERT INTO temp VALUES (1)"));
+    assert(!touchesSession("SELECT 'CREATE TEMPORARY TABLE t'"));
+}
+
+@safe unittest
+{
+    // What opens a transaction, and what ends one.
+    assert(transactionEffect("BEGIN") == TransactionEffect.begins);
+    assert(transactionEffect("begin transaction") == TransactionEffect.begins);
+    assert(transactionEffect("BEGIN WORK") == TransactionEffect.begins);
+    assert(transactionEffect("BEGIN NAME t1") == TransactionEffect.begins);
+    assert(transactionEffect("START TRANSACTION") == TransactionEffect.begins);
+    assert(transactionEffect("  -- note\n BEGIN") == TransactionEffect.begins);
+    assert(transactionEffect("COMMIT") == TransactionEffect.ends);
+    assert(transactionEffect("rollback work") == TransactionEffect.ends);
+
+    // BEGIN followed by a statement opens a scripting block, not a transaction.
+    assert(transactionEffect("BEGIN\n  SELECT 1") == TransactionEffect.none);
+    assert(transactionEffect("BEGIN LET x := 1") == TransactionEffect.none);
+    assert(transactionEffect("START TASK t") == TransactionEffect.none);
+    assert(transactionEffect("SELECT 1") == TransactionEffect.none);
+    assert(transactionEffect("") == TransactionEffect.none);
 }

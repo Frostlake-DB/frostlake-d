@@ -31,7 +31,7 @@ import std.uni : toLower, toUpper;
 import core.time : dur, hnsecs, minutes;
 
 import frostlake.errors;
-import frostlake.value : hexToBytes;
+import frostlake.value : hexToBytes, nearestDouble;
 
 /// What the wire said a cell was.
 enum ValueKind : ubyte
@@ -132,8 +132,9 @@ struct Value
         throw new ValueException(format!"\"%s\" is not an integer"(text_));
     }
 
-    /// The cell as a double. Precision beyond a double's is lost here, which is
-    /// why it is asked for rather than applied.
+    /// The cell as a double: the one nearest the digits the engine sent.
+    /// Precision beyond a double's is lost here, which is why it is asked for
+    /// rather than applied.
     double asDouble() const @safe pure
     {
         requirePresent("a number");
@@ -147,10 +148,14 @@ struct Value
             case "-Infinity", "-Inf", "-inf":              return -double.infinity;
             default: break;
         }
+        double reading;
         try
-            return text_.to!double;
+            reading = text_.to!double;
         catch (ConvException)
             throw new ValueException(format!"\"%s\" is not a number"(text_));
+        // Phobos' parser is not correctly rounded and can land an ulp away,
+        // so the nearest double is settled exactly.
+        return nearestDouble(text_, reading);
     }
 
     /**
@@ -231,13 +236,20 @@ struct Value
     {
         requirePresent("a timestamp");
         const parsed = parseStamp(text_);
-        auto zone = parsed.hasOffset
-            ? cast(immutable SimpleTimeZone) new immutable SimpleTimeZone(minutes(parsed.offsetMinutes))
-            : UTC();
-        auto result = SysTime(parsed.stamp, zone);
-        if (parsed.nanos != 0)
-            result += hnsecs(parsed.nanos / 100);
-        return result;
+        // Phobos refuses an offset of a day or more, `+2500` say, with its own
+        // exception; here that is a reading that fails like any other.
+        try
+        {
+            auto zone = parsed.hasOffset
+                ? cast(immutable SimpleTimeZone) new immutable SimpleTimeZone(minutes(parsed.offsetMinutes))
+                : UTC();
+            auto result = SysTime(parsed.stamp, zone);
+            if (parsed.nanos != 0)
+                result += hnsecs(parsed.nanos / 100);
+            return result;
+        }
+        catch (Exception e)
+            throw new ValueException(format!"\"%s\" is not a timestamp: %s"(text_, e.msg));
     }
 
     /// The reading `T` names, or an empty $(D Nullable) when the cell is NULL.
@@ -359,6 +371,18 @@ struct Column
     bool nullableKnown;
     long precision;
     long scale;
+    /**
+     * A text column's width in characters, or a binary column's in bytes —
+     * the number a client reports as such a column's precision and its
+     * display size.
+     *
+     * `VARCHAR(9)` carries 9 and `BINARY(5)` carries 5; a column declared
+     * without a width carries the maximum instead, 16777216 characters or
+     * 8388608 bytes. Every other type carries nothing at all, and so does an
+     * engine that predates the field: an empty $(D Nullable) says "unknown"
+     * where a `0` would have said "no width".
+     */
+    Nullable!long length;
 }
 
 /// One row: its cells, and the columns they line up with.
@@ -391,6 +415,17 @@ struct Row
 
     /// Iteration over the cells, so a row works in a `foreach`.
     int opApply(scope int delegate(Value) @safe dg) const @safe
+    {
+        return eachCell(dg);
+    }
+
+    /// ditto — the overload a loop body that calls `@system` code resolves to.
+    int opApply(scope int delegate(Value) @system dg) const @system
+    {
+        return eachCell(dg);
+    }
+
+    private int eachCell(Dg)(scope Dg dg) const
     {
         foreach (cell; cells_)
         {
@@ -525,6 +560,17 @@ struct Result
 
     /// Iteration over the rows, so a result works in a `foreach`.
     int opApply(scope int delegate(Row) @safe dg) @safe
+    {
+        return eachRow(dg);
+    }
+
+    /// ditto — the overload a loop body that calls `@system` code resolves to.
+    int opApply(scope int delegate(Row) @system dg) @system
+    {
+        return eachRow(dg);
+    }
+
+    private int eachRow(Dg)(scope Dg dg)
     {
         foreach (row; rows_)
         {
@@ -757,4 +803,45 @@ struct Result
     assert(Value.ofNumber("Infinity").asDouble.isInfinity);
     assert(Value.ofNumber("-Infinity").asDouble < 0);
     assert(Value.ofNumber("NaN").asDouble.isNaN);
+}
+
+@safe unittest
+{
+    // The double nearest the digits, where Phobos' parser reads the next one up.
+    union Bits { ulong bits; double value; }
+    Bits b;
+    b.value = Value.ofNumber("486.3026820789797").asDouble;
+    assert(b.bits == 0x407e64d7c929e4d9);
+    b.value = Value.ofNumber("-486.3026820789797").asDouble;
+    assert(b.bits == 0xc07e64d7c929e4d9);
+}
+
+@safe unittest
+{
+    import std.exception : assertThrown;
+    // An offset no time zone can have is a timestamp that does not read, not
+    // an exception from outside this library.
+    assertThrown!ValueException(Value.ofText("2024-01-15 10:30:05 +2500").asSysTime());
+    assertThrown!ValueException(Value.ofText("2024-01-15 10:30:05 -9959").asSysTime());
+}
+
+@system unittest
+{
+    // A loop body that calls @system code still iterates both containers.
+    static int calls;
+    static void systemCode() @system { calls++; }
+    auto result = Result.make([Column("A", "NUMBER")],
+                              [[Value.ofNumber("1")], [Value.ofNumber("2")]]);
+    foreach (row; result)
+        foreach (cell; row)
+            systemCode();
+    assert(calls == 2);
+    // Breaking out of a @system body stops the walk.
+    calls = 0;
+    foreach (row; result)
+    {
+        systemCode();
+        break;
+    }
+    assert(calls == 1);
 }

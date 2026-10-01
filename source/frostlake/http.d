@@ -13,14 +13,15 @@
  *      TIME_WAIT for minutes afterwards — and the failures then land on
  *      whatever runs $(I next). Here the socket is opened once and every
  *      statement rides it.)
- * $(LI $(B The deadline is the caller's.) One deadline bounds the whole
- *      exchange — connect, write, status line, headers and body — rather than
+ * $(LI $(B The deadlines are the caller's.) One deadline bounds opening the
+ *      socket, across every address the host resolves to, and another bounds
+ *      the whole exchange — write, status line, headers and body — rather than
  *      any single read, so a server dribbling one byte a minute cannot outlast
  *      it by resetting a per-read timer.)
  * )
  *
  * The socket is non-blocking and every wait goes through $(D Socket.select),
- * which is what makes the single deadline enforceable at all.
+ * which is what makes those deadlines enforceable at all.
  */
 module frostlake.http;
 
@@ -29,12 +30,13 @@ import core.time : dur, Duration, MonoTime, msecs, seconds;
 import std.array : appender, Appender;
 import std.conv : ConvException, to;
 import std.format : format;
-import std.socket : Address, AddressFamily, getAddress, Socket, SocketException,
-                    SocketOption, SocketOptionLevel, SocketOSException, SocketSet,
-                    SocketShutdown, SocketType, TcpSocket, wouldHaveBlocked;
+import std.socket : Address, AddressFamily, AddressInfo, getAddressInfo, lastSocketError,
+                    ProtocolType, Socket, SocketException, SocketOption, SocketOptionLevel,
+                    SocketOSException, SocketSet, SocketShutdown, SocketType, TcpSocket,
+                    wouldHaveBlocked;
 import std.string : indexOf, strip, toLower;
 
-import frostlake.dsn : DsnConfig;
+import frostlake.dsn : DsnConfig, urlHost;
 import frostlake.errors;
 
 /// One HTTP response, read whole.
@@ -120,7 +122,10 @@ final class HttpClient
                 return false;
             // Readable between exchanges means EOF or unexpected bytes.
             ubyte[1] peek;
-            const got = socket.receive(peek[]);
+            auto got = socket.receive(peek[]);
+            // A signal that cut the look short says nothing either way; look again.
+            for (int attempt = 0; got == Socket.ERROR && interrupted() && attempt < 100; attempt++)
+                got = socket.receive(peek[]);
             return !(got == Socket.ERROR && wouldHaveBlocked());
         }
         catch (Exception)
@@ -128,12 +133,24 @@ final class HttpClient
     }
 
     /**
-     * Opens the socket, waiting no longer than the DSN's connect timeout.
+     * Opens the socket. The DSN's connect timeout is one deadline over the
+     * whole attempt: each address the host resolves to is tried once, in the
+     * resolver's order, in whatever time the ones before it left.
      *
      * Throws: $(D ConnectionException) when the server cannot be reached, and
      * $(D UsageException) for an `https` DSN, which this build cannot speak.
      */
     void connect() @trusted
+    {
+        connect(config.connectTimeout);
+    }
+
+    /**
+     * As `connect` above, within `limit` rather than the DSN's
+     * `connectTimeout` (`Duration.zero` for no bound). Closing releases the
+     * session this way, within a budget of its own.
+     */
+    void connect(Duration limit) @trusted
     {
         disconnect();
 
@@ -145,22 +162,18 @@ final class HttpClient
                 "engine and point the DSN at that.");
 
         const endpoint = config.baseUrl;
-        Address[] addresses;
-        try
-            addresses = getAddress(config.host, config.port);
-        catch (SocketException e)
-            throw new ConnectionException(
-                format!"cannot resolve %s: %s"(config.host, e.msg), endpoint);
-        if (addresses.length == 0)
-            throw new ConnectionException(
-                format!"%s resolved to no addresses"(config.host), endpoint);
+        const deadline = limit == Duration.zero ? MonoTime.max : MonoTime.currTime + limit;
+        auto addresses = resolve(endpoint);
 
         string lastProblem;
         foreach (address; addresses)
         {
+            // An address that timed out spent the whole budget; the rest get none.
+            if (lastProblem.length && deadline != MonoTime.max && MonoTime.currTime >= deadline)
+                break;
             try
             {
-                socket = openTo(address, endpoint);
+                socket = openTo(address, endpoint, deadline, limit);
                 return;
             }
             catch (ConnectionException e)
@@ -172,27 +185,71 @@ final class HttpClient
         throw new ConnectionException(lastProblem, endpoint);
     }
 
-    private Socket openTo(Address address, string endpoint) @trusted
+    /**
+     * The addresses to try, each once. Stream sockets are asked for by name:
+     * left to itself the resolver answers every address once per socket type,
+     * and each copy used to be tried — and waited on — in turn.
+     */
+    private Address[] resolve(string endpoint) @trusted
     {
-        auto candidate = new TcpSocket(address.addressFamily);
+        AddressInfo[] found;
+        try
+            found = getAddressInfo(config.host, config.port.to!string,
+                                   SocketType.STREAM, ProtocolType.TCP);
+        catch (SocketException e)
+            throw new ConnectionException(
+                format!"cannot resolve %s: %s"(config.host, e.msg), endpoint);
+
+        Address[] addresses;
+        bool[string] seen;
+        foreach (info; found)
+        {
+            const key = info.address.toString();
+            if (key in seen) continue;
+            seen[key] = true;
+            addresses ~= info.address;
+        }
+        if (addresses.length == 0)
+            throw new ConnectionException(
+                format!"%s resolved to no addresses"(config.host), endpoint);
+        return addresses;
+    }
+
+    private Socket openTo(Address address, string endpoint, MonoTime deadline,
+                          Duration limit) @trusted
+    {
+        // Even the descriptor can be refused — a process out of file handles —
+        // and that is as much a failure to connect as a refused handshake.
+        Socket candidate;
+        try
+            candidate = new TcpSocket(address.addressFamily);
+        catch (SocketException e)
+            throw new ConnectionException(
+                format!"cannot open a socket to %s: %s"(endpoint, e.msg), endpoint);
         scope (failure) { try candidate.close(); catch (Exception) { } }
 
-        candidate.blocking = false;
-        // Nagle would hold a small request back waiting for more; a statement
-        // is one write and there is never more coming.
-        candidate.setOption(SocketOptionLevel.TCP, SocketOption.TCP_NODELAY, true);
+        try
+        {
+            candidate.blocking = false;
+            // Nagle would hold a small request back waiting for more; a statement
+            // is one write and there is never more coming.
+            candidate.setOption(SocketOptionLevel.TCP, SocketOption.TCP_NODELAY, true);
+        }
+        catch (SocketException e)
+            throw new ConnectionException(
+                format!"cannot open a socket to %s: %s"(endpoint, e.msg), endpoint);
 
         try
             candidate.connect(address);
         catch (SocketOSException e)
         {
-            if (!wouldHaveBlocked())
+            // Cut short by a signal, a connect carries on in the background, and
+            // the wait below sees it through like any other.
+            if (!isInterruption(e.errorCode) && !wouldHaveBlocked())
                 throw new ConnectionException(
                     format!"cannot reach %s: %s"(endpoint, e.msg), endpoint);
         }
 
-        const deadline = config.connectTimeout == Duration.zero
-            ? MonoTime.max : MonoTime.currTime + config.connectTimeout;
         SocketSet writable, failed;
         int ready;
         for (;;)
@@ -202,21 +259,27 @@ final class HttpClient
             failed = new SocketSet(1);
             writable.add(candidate);
             failed.add(candidate);
-            if (deadline == MonoTime.max)
+            try
             {
-                // An unbounded wait is the overload WITHOUT a timeout: `Duration.max`
-                // splits into a seconds count that overflows the `int` a Windows
-                // timeval holds, and a negative timeval makes select fail at once.
-                ready = Socket.select(null, writable, failed);
+                if (deadline == MonoTime.max)
+                {
+                    // An unbounded wait is the overload WITHOUT a timeout: `Duration.max`
+                    // splits into a seconds count that overflows the `int` a Windows
+                    // timeval holds, and a negative timeval makes select fail at once.
+                    ready = Socket.select(null, writable, failed);
+                }
+                else
+                {
+                    const remaining = deadline - MonoTime.currTime;
+                    if (remaining <= Duration.zero) { ready = 0; break; }
+                    const slice = clampWait(remaining);
+                    ready = Socket.select(null, writable, failed, slice);
+                    if (ready == 0 && slice < remaining) continue;
+                }
             }
-            else
-            {
-                const remaining = deadline - MonoTime.currTime;
-                if (remaining <= Duration.zero) { ready = 0; break; }
-                const slice = clampWait(remaining);
-                ready = Socket.select(null, writable, failed, slice);
-                if (ready == 0 && slice < remaining) continue;
-            }
+            catch (SocketException e)
+                throw new ConnectionException(
+                    format!"cannot reach %s: %s"(endpoint, e.msg), endpoint);
             // A signal cut the wait short with nothing to report (on POSIX,
             // druntime stops every thread with one for each collection), so
             // wait out whatever time is left.
@@ -226,11 +289,15 @@ final class HttpClient
         if (ready == 0)
             throw new ConnectionException(format!
                 "%s did not accept a connection within %s"(
-                endpoint, describe(config.connectTimeout)), endpoint);
+                endpoint, describe(limit)), endpoint);
 
         // A non-blocking connect reports its failure here, not at `connect`.
         int problem;
-        candidate.getOption(SocketOptionLevel.SOCKET, SocketOption.ERROR, problem);
+        try
+            candidate.getOption(SocketOptionLevel.SOCKET, SocketOption.ERROR, problem);
+        catch (SocketException e)
+            throw new ConnectionException(
+                format!"cannot reach %s: %s"(endpoint, e.msg), endpoint);
         if (problem != 0 || failed.isSet(candidate))
             throw new ConnectionException(
                 format!"cannot reach %s: connection failed (error %s)"(endpoint, problem),
@@ -247,10 +314,20 @@ final class HttpClient
      */
     HttpResponse exchange(string method, string path, string payload) @trusted
     {
+        return exchange(method, path, payload, config.timeout);
+    }
+
+    /**
+     * As `exchange` above, bounded by `limit` rather than the DSN's statement
+     * `timeout` (`Duration.zero` for no bound). Connecting's own health check
+     * runs under the connect timeout this way, so a statement deadline cannot
+     * end it.
+     */
+    HttpResponse exchange(string method, string path, string payload, Duration limit) @trusted
+    {
         if (socket is null) connect();
 
         const endpoint = config.baseUrl ~ path;
-        const limit = config.timeout;
         // One deadline for the whole exchange.
         const deadline = limit == Duration.zero ? MonoTime.max : MonoTime.currTime + limit;
 
@@ -259,7 +336,7 @@ final class HttpClient
         request.put(' ');
         request.put(path);
         request.put(" HTTP/1.1\r\nHost: ");
-        request.put(config.host);
+        request.put(urlHost(config.host));
         request.put(':');
         request.put(config.port.to!string);
         request.put("\r\nUser-Agent: frostlake-d/");
@@ -294,8 +371,10 @@ final class HttpClient
             const wrote = socket.send(bytes[sent .. $]);
             if (wrote == Socket.ERROR)
             {
-                if (!wouldHaveBlocked())
-                    fail(format!"cannot write to %s"(endpoint), endpoint);
+                // Would have blocked, or a signal cut the call short: either way
+                // nothing went out, so wait for the socket and send again.
+                if (!wouldHaveBlocked() && !interrupted())
+                    fail(format!"cannot write to %s: %s"(endpoint, lastSocketError), endpoint);
                 waitFor(false, endpoint, deadline, limit);
                 continue;
             }
@@ -316,14 +395,12 @@ final class HttpClient
         const statusLine = readLine(endpoint, deadline, limit);
         const(char)[] rest = statusLine;
         if (rest.length < 8 || rest[0 .. 5] != "HTTP/")
-            throw new ConnectionException(format!
-                "%s answered something that is not HTTP: %s"(endpoint, snippet(statusLine)),
-                endpoint);
+            fail(format!"%s answered something that is not HTTP: %s"(
+                endpoint, snippet(statusLine)), endpoint);
         const versionEnd = rest.indexOf(' ');
         if (versionEnd < 0)
-            throw new ConnectionException(format!
-                "%s answered a malformed status line: %s"(endpoint, snippet(statusLine)),
-                endpoint);
+            fail(format!"%s answered a malformed status line: %s"(
+                endpoint, snippet(statusLine)), endpoint);
         const httpVersion = rest[5 .. versionEnd];
         rest = rest[versionEnd + 1 .. $].strip();
         const codeEnd = rest.indexOf(' ');
@@ -331,9 +408,8 @@ final class HttpClient
         try
             response.status = codeText.to!int;
         catch (ConvException)
-            throw new ConnectionException(format!
-                "%s answered a malformed status line: %s"(endpoint, snippet(statusLine)),
-                endpoint);
+            fail(format!"%s answered a malformed status line: %s"(
+                endpoint, snippet(statusLine)), endpoint);
         response.reason = codeEnd < 0 ? "" : rest[codeEnd + 1 .. $].strip().idup;
 
         for (;;)
@@ -373,13 +449,11 @@ final class HttpClient
             try
                 count = (*length).strip().to!size_t;
             catch (ConvException)
-                throw new ConnectionException(format!
-                    "%s sent a Content-Length that is not a number: %s"(
+                fail(format!"%s sent a Content-Length that is not a number: %s"(
                     endpoint, snippet(*length)), endpoint, response.status);
             if (count > maxBodyBytes)
-                throw new ConnectionException(format!
-                    "%s promised a %s-byte body, past this driver's limit"(endpoint, count),
-                    endpoint, response.status);
+                fail(format!"%s promised a %s-byte body, past this driver's limit"(
+                    endpoint, count), endpoint, response.status);
             return cast(string) readExactly(count, endpoint, deadline, limit).idup;
         }
 
@@ -405,9 +479,8 @@ final class HttpClient
             try
                 size = sizeText.to!size_t(16);
             catch (ConvException)
-                throw new ConnectionException(format!
-                    "%s sent a chunk header that is not a size: %s"(endpoint, snippet(header)),
-                    endpoint);
+                fail(format!"%s sent a chunk header that is not a size: %s"(
+                    endpoint, snippet(header)), endpoint);
 
             if (size == 0)
             {
@@ -416,8 +489,7 @@ final class HttpClient
                 return cast(string) content.data.idup;
             }
             if (content.data.length + size > maxBodyBytes)
-                throw new ConnectionException(format!
-                    "%s sent a body past this driver's limit"(endpoint), endpoint);
+                fail(format!"%s sent a body past this driver's limit"(endpoint), endpoint);
             content.put(readExactly(size, endpoint, deadline, limit));
             readLine(endpoint, deadline, limit);   // the CRLF after the chunk
         }
@@ -458,8 +530,7 @@ final class HttpClient
         while (fillMore(endpoint, deadline, limit, true))
         {
             if (buffer.length > maxBodyBytes)
-                throw new ConnectionException(format!
-                    "%s sent a body past this driver's limit"(endpoint), endpoint);
+                fail(format!"%s sent a body past this driver's limit"(endpoint), endpoint);
         }
         auto slice = buffer[cursor .. $];
         cursor = buffer.length;
@@ -491,8 +562,10 @@ final class HttpClient
                 if (eofEnds) return false;
                 fail(format!"%s closed the connection mid-response"(endpoint), endpoint);
             }
-            if (!wouldHaveBlocked())
-                fail(format!"cannot read from %s"(endpoint), endpoint);
+            // Would have blocked, or a signal cut the call short: either way
+            // nothing was read, so wait for the socket and read again.
+            if (!wouldHaveBlocked() && !interrupted())
+                fail(format!"cannot read from %s: %s"(endpoint, lastSocketError), endpoint);
             waitFor(true, endpoint, deadline, limit);
         }
     }
@@ -517,24 +590,29 @@ final class HttpClient
             ready.add(socket);
             failed.add(socket);
             int outcome;
-            if (deadline == MonoTime.max)
+            try
             {
-                // No bound: the overload WITHOUT a timeout blocks. `Duration.max`
-                // would overflow a Windows timeval and fail the wait at once.
-                outcome = forReading
-                    ? Socket.select(ready, null, failed)
-                    : Socket.select(null, ready, failed);
+                if (deadline == MonoTime.max)
+                {
+                    // No bound: the overload WITHOUT a timeout blocks. `Duration.max`
+                    // would overflow a Windows timeval and fail the wait at once.
+                    outcome = forReading
+                        ? Socket.select(ready, null, failed)
+                        : Socket.select(null, ready, failed);
+                }
+                else
+                {
+                    const remaining = deadline - MonoTime.currTime;
+                    if (remaining <= Duration.zero) expired(endpoint, limit);
+                    const slice = clampWait(remaining);
+                    outcome = forReading
+                        ? Socket.select(ready, null, failed, slice)
+                        : Socket.select(null, ready, failed, slice);
+                    if (outcome == 0 && slice < remaining) continue;
+                }
             }
-            else
-            {
-                const remaining = deadline - MonoTime.currTime;
-                if (remaining <= Duration.zero) expired(endpoint, limit);
-                const slice = clampWait(remaining);
-                outcome = forReading
-                    ? Socket.select(ready, null, failed, slice)
-                    : Socket.select(null, ready, failed, slice);
-                if (outcome == 0 && slice < remaining) continue;
-            }
+            catch (SocketException e)
+                fail(format!"cannot wait on %s: %s"(endpoint, e.msg), endpoint);
             if (outcome == 0) expired(endpoint, limit);
             // A signal cut the wait short with nothing to report (on POSIX,
             // druntime stops every thread with one for each collection), so
@@ -552,10 +630,10 @@ final class HttpClient
     /// Drops the socket and reports. Every wire failure comes through here, so
     /// none of them can leave a half-read socket behind to confuse the next
     /// statement.
-    private void fail(string message, string endpoint) @trusted
+    private void fail(string message, string endpoint, int status = 0) @trusted
     {
         disconnect();
-        throw new ConnectionException(message, endpoint);
+        throw new ConnectionException(message, endpoint, status);
     }
 }
 
@@ -570,6 +648,27 @@ string describe(Duration limit) @safe
     if (millis < 1000) return format!"%sms"(millis);
     if (millis % 1000 == 0) return format!"%ss"(millis / 1000);
     return format!"%.3gs"(millis / 1000.0);
+}
+
+/// Whether a socket call failed only because a signal cut it short — on POSIX,
+/// druntime stops every thread with one for each collection. Nothing was sent
+/// or read, and the call can be made again.
+private bool isInterruption(int code) @safe pure nothrow @nogc
+{
+    version (Posix)
+    {
+        import core.stdc.errno : EINTR;
+        return code == EINTR;
+    }
+    else
+        return false;
+}
+
+/// ditto, for the call that just failed.
+private bool interrupted() @trusted nothrow @nogc
+{
+    import core.stdc.errno : errno;
+    return isInterruption(errno);
 }
 
 /// Trims a server's answer down to something an error message can carry.
@@ -628,6 +727,58 @@ string snippet(const(char)[] text) @safe pure
     }
     catch (ConnectionException e)
         assert(e.endpoint == "http://no-such-host.invalid:18082");
+}
+
+@system unittest
+{
+    import frostlake.dsn : parseDsn;
+    // Each address once, however many socket types the resolver would list it
+    // under: every copy used to cost a connect attempt, and a wait, of its own.
+    auto numeric = new HttpClient(parseDsn("frostlake://127.0.0.1:18082"));
+    assert(numeric.resolve("http://127.0.0.1:18082").length == 1);
+    auto named = new HttpClient(parseDsn("frostlake://localhost:18082"));
+    auto addresses = named.resolve("http://localhost:18082");
+    assert(addresses.length >= 1);
+    foreach (i, a; addresses)
+        foreach (b; addresses[i + 1 .. $])
+            assert(a.toString() != b.toString());
+}
+
+version (linux) @system unittest
+{
+    import core.sys.posix.sys.resource : getrlimit, rlimit, RLIMIT_NOFILE, setrlimit;
+    import std.socket : InternetAddress;
+    import frostlake.dsn : parseDsn;
+
+    // A process out of file descriptors cannot open a socket, and that is a
+    // failure to connect like any other, not an exception from std.socket.
+    auto client = new HttpClient(parseDsn("frostlake://127.0.0.1:1"));
+    auto address = new InternetAddress("127.0.0.1", 1);
+    rlimit saved;
+    assert(getrlimit(RLIMIT_NOFILE, &saved) == 0);
+    auto none = saved;
+    none.rlim_cur = 0;
+    assert(setrlimit(RLIMIT_NOFILE, &none) == 0);
+    Throwable caught;
+    try
+        client.openTo(address, "http://127.0.0.1:1", MonoTime.max, Duration.zero);
+    catch (Throwable e)
+        caught = e;
+    setrlimit(RLIMIT_NOFILE, &saved);
+    assert(cast(ConnectionException) caught !is null,
+           caught is null ? "nothing was thrown" : typeid(caught).name ~ ": " ~ caught.msg);
+}
+
+version (Posix) @system unittest
+{
+    import core.stdc.errno : EAGAIN, EINTR, errno;
+    // Only an interruption is retried; a call that would have blocked is waited
+    // on, and anything else is a failure.
+    errno = EINTR;
+    assert(interrupted());
+    errno = EAGAIN;
+    assert(!interrupted());
+    assert(isInterruption(EINTR) && !isInterruption(EAGAIN));
 }
 
 private bool canFind(const(char)[] haystack, const(char)[] needle) @safe pure

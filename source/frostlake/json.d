@@ -497,6 +497,49 @@ string encodeJsonString(const(char)[] text) @safe pure nothrow
     return result.data;
 }
 
+/**
+ * Writes `value` back out as compact JSON text: a number keeps the digits it
+ * arrived as, a string is escaped as $(D encodeJsonString) escapes it, and an
+ * object keeps its entries in wire order.
+ */
+string encodeJson(const JsonValue value) @safe pure
+{
+    auto result = appender!string();
+    writeJson(result, value);
+    return result.data;
+}
+
+private void writeJson(ref Appender!string result, const JsonValue value) @safe pure
+{
+    final switch (value.kind_)
+    {
+        case JsonKind.null_:   result.put("null"); break;
+        case JsonKind.boolean: result.put(value.boolean_ ? "true" : "false"); break;
+        case JsonKind.number:  result.put(value.text_); break;
+        case JsonKind.text:    result.put(encodeJsonString(value.text_)); break;
+        case JsonKind.array:
+            result.put('[');
+            foreach (i, item; value.items_)
+            {
+                if (i) result.put(',');
+                writeJson(result, item);
+            }
+            result.put(']');
+            break;
+        case JsonKind.object:
+            result.put('{');
+            foreach (i, entry; value.entries_)
+            {
+                if (i) result.put(',');
+                result.put(encodeJsonString(entry.key));
+                result.put(':');
+                writeJson(result, entry.value);
+            }
+            result.put('}');
+            break;
+    }
+}
+
 // ---------------------------------------------------------------- unittests
 
 @safe unittest
@@ -627,4 +670,15 @@ string encodeJsonString(const(char)[] text) @safe pure nothrow
     // A statement with a quoted identifier survives the round trip intact.
     enum sql = `SELECT "col" FROM t WHERE v = 'a\b' AND w = '` ~ "\n" ~ `'`;
     assert(parseJson(encodeJsonString(sql)).text == sql);
+}
+
+@safe unittest
+{
+    // Written back out, a document keeps its digits, its order and its escapes.
+    enum doc = `{"a":[1,2.50,-0,1E+10,"x\"y",null,true,false],"b":{},"c":[],"é":"\n"}`;
+    assert(encodeJson(parseJson(doc)) == doc);
+    // Whitespace between tokens is not kept.
+    assert(encodeJson(parseJson(` [ 1 , { "k" : "v" } ] `)) == `[1,{"k":"v"}]`);
+    assert(encodeJson(JsonValue.ofNull()) == "null");
+    assert(encodeJson(JsonValue.ofText("q\"")) == `"q\""`);
 }

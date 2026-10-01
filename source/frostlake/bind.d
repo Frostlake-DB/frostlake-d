@@ -40,10 +40,10 @@ struct BindSite
  * Every bind site in a statement, in the order they appear.
  *
  * A colon is a placeholder only where nothing else claims it. `::` is a cast
- * and `:=` an assignment; a colon $(I adjacent) to the end of an expression —
- * an identifier character, a closing bracket, or a quote — is VARIANT path
- * access (`v:field`, `PARSE_JSON('...'):k`) rather than a marker; and `:1` is a
- * positional reference, not a name.
+ * and `:=` an assignment; a colon $(I adjacent) to the end of an operand — an
+ * identifier character, a closing bracket or brace, a quote, or a `?` — is
+ * VARIANT path access (`v:field`, `PARSE_JSON('...'):k`, `?:k`) rather than a
+ * marker; and `:1` is a positional reference, not a name.
  */
 BindSite[] bindSites(const(char)[] sql) @safe pure
 {
@@ -68,7 +68,7 @@ BindSite[] bindSites(const(char)[] sql) @safe pure
         {
             const prev = sql[i - 1];
             if (isWordChar(prev) || prev == ')' || prev == ']' || prev == '}'
-                || prev == '"' || prev == '\'')
+                || prev == '"' || prev == '\'' || prev == '?')
                 continue;
         }
 
@@ -260,8 +260,30 @@ private string render(const(char)[] sql, const(BindSite)[] sites, const(string)[
     assert(bindSites(`SELECT PARSE_JSON('{}'):k`).length == 0);   // path off a string
     assert(bindSites("SELECT OBJECT_CONSTRUCT('a',1):a").length == 0);
     assert(bindSites(`SELECT "V":k FROM t`).length == 0);         // path off an identifier
+    assert(bindSites("SELECT arr[0]:k FROM t").length == 0);      // path off an element
+    assert(bindSites("SELECT {'a': 1}:a").length == 0);           // path off an object
+    assert(bindSites("SELECT '{}':k").length == 0);               // path off a literal
+    assert(bindSites("SELECT $1:k FROM t").length == 0);          // path off a column number
     assert(bindSites("SELECT :1").length == 0);                   // positional reference
     assert(bindSites("SELECT a : b").length == 0);                // a bare colon
+}
+
+@safe unittest
+{
+    import frostlake.value : toParam;
+    // A `?` ends an operand as a name or a closing bracket does, so a colon
+    // glued to one reads a path off the bound value rather than opening a
+    // `:name` marker. Spaced off it, the colon opens one again.
+    auto sites = bindSites("SELECT ?:a");
+    assert(sites.length == 1);
+    assert(sites[0].isPositional);
+    assert(bindCount("SELECT ?:a") == 1);
+    assert(bindPositional("SELECT ?:a", [toParam(1)]) == "SELECT 1:a");
+    assert(bindPositional("SELECT ?:a::INT", [Param.ofVariant(`{"a":1}`)])
+           == `SELECT PARSE_JSON('{"a":1}'):a::INT`);
+    assert(bindPositional("SELECT ?:a", []) == "SELECT ?:a");
+    assert(bindNames("SELECT ? :a") == ["A"]);
+    assert(bindNames("SELECT v :a FROM t") == ["A"]);
 }
 
 @safe unittest

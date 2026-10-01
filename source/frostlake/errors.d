@@ -1,7 +1,7 @@
 /**
  * What can go wrong, and how a caller tells the cases apart.
  *
- * Four kinds, because a caller does something different about each:
+ * Five kinds, because a caller does something different about each:
  *
  *  $(UL
  *  $(LI $(D UsageException) — this program is wrong. A malformed DSN, a bind
@@ -13,10 +13,14 @@
  *       why the driver never retries one itself.)
  *  $(LI $(D QueryException) — the engine understood the statement and refused
  *       it. The connection is fine and the session is intact.)
+ *  $(LI $(D SessionLostException) — the engine no longer holds the session, and
+ *       what it held (an open transaction, a `USE`, a variable) went with it.
+ *       The statement did $(I not) run; the connection is fine, and its next
+ *       statement starts a fresh session on the DSN's scope.)
  *  $(LI $(D ValueException) — a cell was read as a type it does not hold.)
  *  )
  *
- * All four derive from $(D FrostlakeException), so `catch (FrostlakeException)`
+ * All five derive from $(D FrostlakeException), so `catch (FrostlakeException)`
  * catches everything this library throws and nothing it does not.
  */
 module frostlake.errors;
@@ -79,6 +83,33 @@ class QueryException : FrostlakeException
     }
 }
 
+/**
+ * The engine no longer holds the connection's session — it expired, was
+ * released, or the server restarted — and the statement did $(I not) run.
+ *
+ * When the lost session held nothing a fresh one lacks, the driver starts a
+ * fresh session on the DSN's scope and sends the statement once more, and
+ * nothing is thrown. This is thrown instead when the session held something
+ * that cannot be put back: an open transaction, or context set up on it — a
+ * `USE`, `SET` or `ALTER SESSION`, a temporary object. Re-running the
+ * statement without those would run it somewhere its author did not intend.
+ *
+ * The connection stays usable: its next statement starts a fresh session on
+ * the DSN's scope.
+ */
+class SessionLostException : FrostlakeException
+{
+    /// The statement that did not run, as it would have been sent.
+    string statement;
+
+    this(string msg, string statement = null,
+         string file = __FILE__, size_t line = __LINE__, Throwable next = null) @safe pure nothrow
+    {
+        super(msg, file, line, next);
+        this.statement = statement;
+    }
+}
+
 /// A cell was read as a type it does not hold.
 class ValueException : FrostlakeException
 {
@@ -99,4 +130,12 @@ class ValueException : FrostlakeException
     auto c = new ConnectionException("gone", "http://h:1/api/execute");
     assert(c.endpoint == "http://h:1/api/execute");
     assert(c.status == 0);
+
+    // A lost session is its own kind: the statement did not run, which is not
+    // what a refusal or a broken wire says.
+    auto s = new SessionLostException("lost", "INSERT INTO t VALUES (1)");
+    assert(cast(FrostlakeException) s !is null);
+    static assert(!is(SessionLostException : QueryException));
+    static assert(!is(SessionLostException : ConnectionException));
+    assert(s.statement == "INSERT INTO t VALUES (1)");
 }

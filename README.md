@@ -84,6 +84,11 @@ Param[string] mixed = ["n": toParam(3), "s": toParam("x")];
 conn.executeNamed("SELECT :n AS n, :s AS s", mixed);
 ```
 
+A colon glued to the end of an operand is Snowflake's path access, not a marker — `v:field`,
+`PARSE_JSON('…'):k`, `"V":k`, and `?:k`, a path off a bound value — so a `:name` marker follows a
+space, an operator, a comma or an opening bracket: `v :name` is one. A `::` cast, a `:=`
+assignment and a `:1` are never markers.
+
 `conn.render(sql, args)` shows exactly what would be sent, without sending it.
 
 ## Cells keep the engine's own text
@@ -126,7 +131,56 @@ conn.transaction({
 });   // commits, or rolls back and re-raises
 ```
 
-`begin`, `commit` and `rollback` are there for when the scoped form does not fit.
+`begin`, `commit` and `rollback` are there for when the scoped form does not fit. A `BEGIN` run as
+a statement opens a transaction too, and `inTransaction` reports it until its `COMMIT` or `ROLLBACK`.
+
+## Session lifetime
+
+The engine keeps a session until the connection closes, or until it idles past the engine's
+expiry (30 minutes), is released, or the server restarts. What the driver does about that:
+
+- **What is sent.** Every request after the first names the connection's session. Once the
+  engine's first answer carries `newSession` — engines from 0.1.0 on do — each of those requests
+  also carries `requireSession: true`, so an engine that no longer holds the session refuses the
+  request with HTTP 404 and runs nothing, rather than running it in a fresh session at the
+  server's default scope. An engine without `newSession` is never sent the field.
+- **After a lost session.** When the lost session held nothing a fresh one lacks, the driver puts
+  the DSN's scope (`USE ROLE`, `WAREHOUSE`, `DATABASE`, `SCHEMA`) onto a fresh session and sends the
+  statement once more; a second refusal raises. When it held an open transaction, or context set
+  up on it — a `USE`, `SET`/`UNSET`, `ALTER SESSION`, a temporary object, a `CREATE`/`DROP` of a
+  database or schema — re-running the statement would put it somewhere its author did not intend,
+  so a `SessionLostException` says so instead, and the statement did not run. Either way the
+  connection stays usable, and its next statement starts a fresh session on the DSN's scope.
+- **What close does.** `close()` gives the session back with `DELETE /api/sessions/{id}`, which also
+  rolls back a transaction left open on it. That is best effort: it spends at most the shorter of
+  five seconds and the DSN's `timeout`, never raises, and a second `close()` sends nothing. An
+  engine without `newSession` has no such endpoint and is sent nothing; its session lingers until
+  the engine's idle expiry, as it always did.
+
+Against an engine without `newSession`, a lapsed session is rebuilt silently under the same id, so
+a connection idle for longer than `idleLimit` re-applies the DSN's scope before its next statement
+— unless the caller moved the scope themselves or a transaction is open. An engine that answers
+`newSession` never needs that guess.
+
+## Several statements in one request
+
+`executeAll` returns one `Result` per statement, but a session runs one statement per request
+until it is told otherwise, and refuses a request carrying more. `ALTER SESSION SET
+MULTI_STATEMENT_COUNT = n` says it for the session; `ExecuteOptions.multiStatementCount` says it
+for one call:
+
+```d
+ExecuteOptions options;
+options.multiStatementCount = 2;
+auto sets = conn.executeAll("CREATE TABLE t (id INTEGER); INSERT INTO t VALUES (1), (2)", options);
+```
+
+The count applies to that request and outranks the session's setting for it; `0` accepts any
+number. It moves no session state, so there is nothing to save and put back, and two connections
+cannot disturb each other's packing. Left unset — as `execute(sql, args)` and `executeAll(sql,
+args)` leave it — the request carries no such field at all and the session's value decides, exactly
+as before. `executePositional` and `executeNamed` take the options as a trailing argument, so a
+packed request can carry binds too.
 
 ## Errors
 
@@ -137,6 +191,7 @@ Everything thrown derives from `FrostlakeException`:
 | `UsageException` | the call was wrong — bad DSN, bind count mismatch, closed connection | nothing was sent; fix the code |
 | `ConnectionException` | the wire | the statement's fate is **unknown** — it may have run |
 | `QueryException` | the engine refused the statement | the connection and its session are intact |
+| `SessionLostException` | the engine no longer holds the session, and its transaction or context went with it | the statement did **not** run; the next one starts a fresh session on the DSN's scope |
 | `ValueException` | a cell read as a type it does not hold | ask for a different reading |
 
 The driver never retries a statement itself. If an exchange breaks part way through, the socket is
@@ -149,8 +204,9 @@ Note that a refused statement arrives as HTTP 500 carrying the ordinary JSON env
 ## One socket per connection
 
 Statements share one keep-alive socket for the connection's whole life. `connectTimeout` bounds
-each attempt to open it, and `timeout` bounds a whole exchange — write, status line, headers and
-body — rather than any single read.
+opening it — one deadline across every address the host resolves to, each tried once — and the
+health check a new connection makes, which is part of connecting. `timeout` bounds a whole
+statement exchange — write, status line, headers and body — rather than any single read.
 
 This matters more than it sounds. A driver that opens a socket per statement burns an ephemeral
 TCP port per statement; a run of a few thousand statements empties the machine's dynamic port
@@ -176,12 +232,13 @@ refused (see TLS).
 | --- | --- |
 | `schema`, `role`, `warehouse` | the rest of the session's scope, selected at connect |
 | `timeout` | how long one statement may take (default `300s`) |
-| `connectTimeout` | how long to wait for the socket (default `10s`) |
-| `idleLimit` | how long a connection may idle before its scope is re-applied (default `20m`) |
+| `connectTimeout` | how long to wait for the socket and the connect-time health check (default `10s`) |
+| `idleLimit` | how long a connection may idle before its scope is re-applied, against an engine without `newSession` (default `20m`) |
 | `tls` | accepted for compatibility with the other drivers; `true` is refused at connect, as `https://` is |
 
 Durations are written `30s`, `500ms`, `5m`, `2h`, or a bare number of seconds; `0` removes the
-bound. Anything set in `ConnectOptions` outranks the DSN. Where the Frostlake drivers share a
+bound. Anything set in `ConnectOptions` outranks the DSN: a duration left unset there keeps the
+DSN's value, and one set to `Duration.zero` removes the bound. Where the Frostlake drivers share a
 parameter they spell it the same, and any parameter this driver does not know is refused as a typo.
 
 The scope is applied *before* the constructor returns, so a DSN naming a database that does not
@@ -201,13 +258,25 @@ Two layers, and each tests something the other cannot:
   parser, the SQL scanner, binding, literal rendering, cell readings. No server involved.
 - **`dub run -c integration`** — a scripted server for the answers a healthy engine will never
   give (a chunked body, a header in the wrong case, a proxy's HTML error page, a `Connection:
-  close`, a response cut off mid-body), then 18 tests against a real engine it boots itself.
+  close`, a response cut off mid-body, a session the engine no longer holds, a `DELETE` that
+  hangs), then 23 tests against a real engine it boots itself.
 
 `FROSTLAKE_CLASSPATH` is the engine's Java classpath — the `frostlake-db` jar and its
 dependencies — and the tests start `java` from `JAVA_HOME` or the `PATH`. The engine is booted
 with a per-run home and data directory, so a run never inherits the last one's account-level
 objects. Without `FROSTLAKE_CLASSPATH` the engine-backed tests report themselves as skipped
 rather than passing against nothing.
+
+The engine's language-neutral testkit corpus is replayed through the driver when `FL_CORPUS` names
+frostlake's `engine/src/test/resources/testkit` (an absolute path is safest): `dub run -c
+integration` then ends with it, on an engine of its own or the server `FROSTLAKE_URL` names, and
+reports it as skipped otherwise. `dub run -c testkit` replays the corpus alone; either way the
+per-case report lands in `results/testkit-d.tsv`.
+
+```bash
+FL_CORPUS=/path/to/frostlake/engine/src/test/resources/testkit \
+    FROSTLAKE_CLASSPATH='.../lib/*' dub run -c integration
+```
 
 `sh build.sh` compiles and runs the unit tests without dub, for a faster edit loop; point `DMD` at
 your compiler first.
@@ -235,7 +304,7 @@ export DUB_HOME=C:/dub-home
 | `source/frostlake/bind.d` | finding `?` and `:name`, and replacing them |
 | `source/frostlake/value.d` | D values rendered as SQL literals |
 | `source/frostlake/result.d` | `Result`, `Row`, `Column`, `Value` |
-| `source/frostlake/errors.d` | the four exception types |
+| `source/frostlake/errors.d` | the five exception types |
 
 ## License
 

@@ -43,7 +43,9 @@
  * $(D UsageException) for a caller mistake (nothing was sent),
  * $(D ConnectionException) for the wire (the statement's fate is unknown),
  * $(D QueryException) for a statement the engine refused (the session is
- * intact), and $(D ValueException) for a cell read as a type it does not hold.
+ * intact), $(D SessionLostException) for a statement that did not run because
+ * the engine no longer holds the session and what it held went with it, and
+ * $(D ValueException) for a cell read as a type it does not hold.
  *
  * $(H2 TLS)
  *
@@ -55,10 +57,11 @@
  */
 module frostlake;
 
-public import frostlake.connection : connect, Connection, ConnectOptions;
+public import frostlake.connection : connect, Connection, ConnectOptions, ExecuteOptions;
 public import frostlake.dsn : DsnConfig, parseDsn, quoteIdentifier, defaultPort;
 public import frostlake.errors : ConnectionException, FrostlakeException,
-                                 QueryException, UsageException, ValueException;
+                                 QueryException, SessionLostException, UsageException,
+                                 ValueException;
 public import frostlake.http : driverVersion;
 public import frostlake.result : Column, Result, Row, Value, ValueKind;
 public import frostlake.value : baseType, isBinaryType, isVariantType, Param,
