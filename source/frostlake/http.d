@@ -638,7 +638,7 @@ final class HttpClient
 }
 
 /// The version this driver reports in its `User-Agent`.
-enum string driverVersion = "0.1.0";
+enum string driverVersion = "0.2.0";
 
 /// Renders a duration the way a person would say it.
 string describe(Duration limit) @safe

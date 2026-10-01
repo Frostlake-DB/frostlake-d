@@ -30,7 +30,7 @@ foreach (row; conn.execute("SELECT id, name FROM people ORDER BY id"))
 Add it to your `dub.json`:
 
 ```json
-"dependencies": { "frostlake": "~>0.1.0" }
+"dependencies": { "frostlake": "~>0.2.0" }
 ```
 
 Or point dub at a local checkout:
